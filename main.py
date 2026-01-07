@@ -14,14 +14,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Konfiguracija
-WP_BASE_URL = 'https://berliner.hr/wp-json/thor/v1'
-BATCH_SIZE = 50  # Koliko SKU-ova odjednom
-DELAY_SECONDS = 1  # Pauza između batch-eva
+WP_JAMJAM_URL = 'https://jamjam.hr/wp-json/jamjam/v1'
+WP_BERLINER_URL = 'https://berliner.hr/wp-json/thor/v1'
 
-def send_batch(items, endpoint):
+BATCH_SIZE = 50
+DELAY_SECONDS = 1
+
+# JamJam lokacije
+JAMJAM_LOCATIONS = ['p001', 'p0001', 'p14', 'p18', 'p28', 'p20']
+
+def send_batch(items, endpoint, base_url):
     """Šalje jedan batch na WordPress"""
     try:
-        url = f"{WP_BASE_URL}{endpoint}"
+        url = f"{base_url}{endpoint}"
         logger.info(f"🔄 Sending {len(items)} items to {url}")
         
         response = requests.post(
@@ -32,7 +37,6 @@ def send_batch(items, endpoint):
         )
         
         logger.info(f"📡 WordPress response: {response.status_code}")
-        
         response.raise_for_status()
         
         return {'success': True, 'count': len(items), 'status_code': response.status_code}
@@ -46,8 +50,8 @@ def send_batch(items, endpoint):
         logger.error(f"❌ Unexpected error for {endpoint}: {str(e)}")
         return {'success': False, 'count': len(items), 'error': str(e)}
 
-def process_location(items, endpoint, location_name):
-    """Procesira sve stavke za jednu lokaciju (Split ili Osijek)"""
+def process_location(items, endpoint, location_name, base_url):
+    """Procesira sve stavke za jednu lokaciju"""
     if not items:
         logger.info(f"⚠️ No items for {location_name}")
         return {'total': 0, 'success': 0, 'failed': 0}
@@ -61,14 +65,13 @@ def process_location(items, endpoint, location_name):
     
     logger.info(f"📦 Processing {len(items)} items for {location_name}")
     
-    # Podijeli u batch-eve
     for i in range(0, len(items), BATCH_SIZE):
         batch = items[i:i + BATCH_SIZE]
         batch_num = (i // BATCH_SIZE) + 1
         
-        logger.info(f"📤 Sending batch {batch_num}/{(len(items)-1)//BATCH_SIZE + 1} for {location_name} ({len(batch)} items)")
+        logger.info(f"📤 Sending batch {batch_num} for {location_name} ({len(batch)} items)")
         
-        result = send_batch(batch, endpoint)
+        result = send_batch(batch, endpoint, base_url)
         
         if result['success']:
             results['success'] += result['count']
@@ -81,7 +84,6 @@ def process_location(items, endpoint, location_name):
             })
             logger.error(f"❌ Batch {batch_num} failed: {result.get('error')}")
         
-        # Pauza između batch-eva (osim zadnjeg)
         if i + BATCH_SIZE < len(items):
             logger.info(f"⏳ Waiting {DELAY_SECONDS}s before next batch...")
             time.sleep(DELAY_SECONDS)
@@ -89,126 +91,119 @@ def process_location(items, endpoint, location_name):
     logger.info(f"✅ {location_name} completed: {results['success']}/{results['total']} successful")
     return results
 
+# ============================================
+# BERLINER ENDPOINTS (Split, Osijek)
+# ============================================
+
+@app.route('/berliner/split', methods=['POST'])
+def berliner_split():
+    """Berliner Split endpoint"""
+    try:
+        items = request.get_json()
+        if not isinstance(items, list):
+            return jsonify({'error': 'Expected array of items'}), 400
+        
+        logger.info(f"📥 [BERLINER] Received {len(items)} Split items")
+        results = process_location(items, '/split', 'Berliner Split', WP_BERLINER_URL)
+        
+        return jsonify({
+            'status': 'completed',
+            'site': 'berliner',
+            'location': 'split',
+            'results': results
+        }), 200
+    except Exception as e:
+        logger.error(f"❌ [BERLINER] Error in split: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/berliner/osijek', methods=['POST'])
+def berliner_osijek():
+    """Berliner Osijek endpoint"""
+    try:
+        items = request.get_json()
+        if not isinstance(items, list):
+            return jsonify({'error': 'Expected array of items'}), 400
+        
+        logger.info(f"📥 [BERLINER] Received {len(items)} Osijek items")
+        results = process_location(items, '/osijek', 'Berliner Osijek', WP_BERLINER_URL)
+        
+        return jsonify({
+            'status': 'completed',
+            'site': 'berliner',
+            'location': 'osijek',
+            'results': results
+        }), 200
+    except Exception as e:
+        logger.error(f"❌ [BERLINER] Error in osijek: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================
+# JAMJAM ENDPOINTS (P001, P0001, P14, P18, P28, P20)
+# ============================================
+
+@app.route('/jamjam/<location>', methods=['POST'])
+def jamjam_location(location):
+    """JamJam dynamic location endpoint"""
+    try:
+        if location not in JAMJAM_LOCATIONS:
+            return jsonify({'error': f'Invalid location. Valid: {JAMJAM_LOCATIONS}'}), 400
+        
+        items = request.get_json()
+        if not isinstance(items, list):
+            return jsonify({'error': 'Expected array of items'}), 400
+        
+        logger.info(f"📥 [JAMJAM] Received {len(items)} items for {location.upper()}")
+        results = process_location(items, f'/{location}', f'JamJam {location.upper()}', WP_JAMJAM_URL)
+        
+        return jsonify({
+            'status': 'completed',
+            'site': 'jamjam',
+            'location': location,
+            'results': results
+        }), 200
+    except Exception as e:
+        logger.error(f"❌ [JAMJAM] Error in {location}: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# ============================================
+# UTILITY ENDPOINTS
+# ============================================
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
     return jsonify({
         'status': 'ok',
-        'service': 'THOR Stock Sync',
+        'service': 'Multi-Site Stock Sync',
+        'sites': {
+            'berliner': ['split', 'osijek'],
+            'jamjam': JAMJAM_LOCATIONS
+        },
         'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
     })
-
-@app.route('/sync/split', methods=['POST'])
-def sync_split():
-    """Endpoint za Split zalihe - SINKRONO"""
-    try:
-        items = request.get_json()
-        
-        if not isinstance(items, list):
-            logger.error("❌ Invalid request: expected array")
-            return jsonify({'error': 'Expected array of items'}), 400
-        
-        logger.info(f"📥 Received {len(items)} Split items")
-        
-        # SINKRONO procesiranje - čeka da završi
-        results = process_location(items, '/split', 'Split')
-        
-        logger.info(f"🏁 Split sync completed: {results}")
-        
-        return jsonify({
-            'status': 'completed',
-            'message': f'Processed {len(items)} Split items',
-            'results': results
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"❌ Error in sync_split: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/sync/osijek', methods=['POST'])
-def sync_osijek():
-    """Endpoint za Osijek zalihe - SINKRONO"""
-    try:
-        items = request.get_json()
-        
-        if not isinstance(items, list):
-            logger.error("❌ Invalid request: expected array")
-            return jsonify({'error': 'Expected array of items'}), 400
-        
-        logger.info(f"📥 Received {len(items)} Osijek items")
-        
-        # SINKRONO procesiranje - čeka da završi
-        results = process_location(items, '/osijek', 'Osijek')
-        
-        logger.info(f"🏁 Osijek sync completed: {results}")
-        
-        return jsonify({
-            'status': 'completed',
-            'message': f'Processed {len(items)} Osijek items',
-            'results': results
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"❌ Error in sync_osijek: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-@app.route('/sync/combined', methods=['POST'])
-def sync_combined():
-    """Endpoint za obje lokacije odjednom - SINKRONO"""
-    try:
-        data = request.get_json()
-        
-        split_items = data.get('split', [])
-        osijek_items = data.get('osijek', [])
-        
-        if not isinstance(split_items, list) and not isinstance(osijek_items, list):
-            logger.error("❌ Invalid request: expected split and/or osijek arrays")
-            return jsonify({'error': 'Expected split and/or osijek arrays'}), 400
-        
-        total_count = len(split_items) + len(osijek_items)
-        logger.info(f"📥 Received {len(split_items)} Split + {len(osijek_items)} Osijek items")
-        
-        results_combined = {}
-        
-        # Procesiranje Split
-        if split_items:
-            logger.info("🔄 Starting Split processing...")
-            results_combined['split'] = process_location(split_items, '/split', 'Split')
-        
-        # Procesiranje Osijek
-        if osijek_items:
-            logger.info("🔄 Starting Osijek processing...")
-            results_combined['osijek'] = process_location(osijek_items, '/osijek', 'Osijek')
-        
-        logger.info(f"🏁 Combined sync completed: {results_combined}")
-        
-        return jsonify({
-            'status': 'completed',
-            'message': f'Processed {len(split_items)} Split and {len(osijek_items)} Osijek items',
-            'results': results_combined
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"❌ Error in sync_combined: {str(e)}")
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def index():
     """Root endpoint"""
     return jsonify({
-        'service': 'THOR Stock Sync Railway',
-        'version': '1.1 - Synchronous',
-        'endpoints': {
-            'health': '/health',
-            'split': '/sync/split',
-            'osijek': '/sync/osijek',
-            'combined': '/sync/combined'
+        'service': 'Multi-Site Stock Sync Railway',
+        'version': '2.0',
+        'sites': {
+            'berliner': {
+                'url': 'https://berliner.hr',
+                'endpoints': ['/berliner/split', '/berliner/osijek']
+            },
+            'jamjam': {
+                'url': 'https://jamjam.hr',
+                'endpoints': [f'/jamjam/{loc}' for loc in JAMJAM_LOCATIONS]
+            }
         }
     })
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
-    logger.info(f"🚀 Starting THOR Stock Sync on port {port}")
-    logger.info(f"📍 WordPress endpoint: {WP_BASE_URL}")
+    logger.info(f"🚀 Starting Multi-Site Stock Sync on port {port}")
+    logger.info(f"📍 Berliner endpoint: {WP_BERLINER_URL}")
+    logger.info(f"📍 JamJam endpoint: {WP_JAMJAM_URL}")
     logger.info(f"📦 Batch size: {BATCH_SIZE}")
     app.run(host='0.0.0.0', port=port, debug=False)
