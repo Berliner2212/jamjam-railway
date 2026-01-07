@@ -1,127 +1,213 @@
 from flask import Flask, request, jsonify
 import requests
+import time
+import logging
+from concurrent.futures import ThreadPoolExecutor
 import os
-import base64
 
 app = Flask(__name__)
 
-def get_wc_auth(site):
-    if site == 'jamjam':
-        key = os.getenv('ck_3ee27ef20acd559b210ea2f4577a9439e0a2cb9f')
-        secret = os.getenv('cs_3beba8b6babdef7c911d90a43a9f2be926292791')
-        url = os.getenv('WORDPRESS_URL', 'https://jamjam.hr')
-    else:
-        key = os.getenv('ck_5958eee3fff61c098712265a905dd9463fb74795')
-        secret = os.getenv('cs_5793896b0048eb854e1592a8def97c2534ce42b9')
-        url = os.getenv('BERLINER_WORDPRESS_URL', 'https://berliner.hr')
-    
-    auth = base64.b64encode(f"{key}:{secret}".encode()).decode()
-    return url, auth
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-@app.route('/health', methods=['GET'])
-def health():
-    return jsonify({"status": "ok"}), 200
+# Konfiguracija
+WP_BASE_URL = 'https://berliner.hr/wp-json/thor/v1'
+BATCH_SIZE = 50  # Koliko SKU-ova odjednom
+DELAY_SECONDS = 1  # Pauza između batch-eva
+MAX_WORKERS = 2  # Paralelno procesiranje Split i Osijek
 
-@app.route('/update-stock-jamjam', methods=['POST'])
-def update_stock_jamjam():
-    return update_stock('jamjam')
-
-@app.route('/update-stock-berliner', methods=['POST'])
-def update_stock_berliner():
-    return update_stock('berliner')
-
-def update_stock(site):
-    wordpress_url, auth = get_wc_auth(site)
-    
-    print(f"🚀 {site.upper()} stock update triggered")
-    
-    # Dohvati listu SKU-ova iz request body
-    request_data = request.get_json()
-    sku_list = request_data.get('skus', [])
-    
-    if not sku_list or len(sku_list) == 0:
-        return jsonify({"error": "No SKUs provided"}), 400
-    
-    print(f"📦 Received {len(sku_list)} SKUs to update")
-    
-    # Dohvati stock podatke iz WordPress-a
-    if site == 'jamjam':
-        stock_endpoint = f"{wordpress_url}/wp-json/jamjam/v1/get-all-stock"
-    else:
-        stock_endpoint = f"{wordpress_url}/wp-json/thor/v1/get-all-stock"
-    
+def send_batch(items, endpoint):
+    """Šalje jedan batch na WordPress"""
     try:
-        response = requests.get(stock_endpoint, timeout=120)
-        all_stock_data = response.json()
+        url = f"{WP_BASE_URL}{endpoint}"
+        response = requests.post(
+            url,
+            json=items,
+            timeout=30,
+            headers={'Content-Type': 'application/json'}
+        )
+        response.raise_for_status()
+        return {'success': True, 'count': len(items)}
     except Exception as e:
-        print(f"❌ Error fetching stock data: {e}")
-        return jsonify({"error": str(e)}), 500
+        logger.error(f"Batch failed for {endpoint}: {str(e)}")
+        return {'success': False, 'count': len(items), 'error': str(e)}
+
+def process_location(items, endpoint, location_name):
+    """Procesira sve stavke za jednu lokaciju (Split ili Osijek)"""
+    if not items:
+        logger.info(f"No items for {location_name}")
+        return {'total': 0, 'success': 0, 'failed': 0}
     
-    # Filtriraj samo SKU-ove iz liste
-    stock_data = {sku: all_stock_data[sku] for sku in sku_list if sku in all_stock_data}
-    
-    print(f"✅ Found stock data for {len(stock_data)} products")
-    
-    updated = 0
-    errors = 0
-    not_found = 0
-    
-    headers = {
-        'Authorization': f'Basic {auth}',
-        'Content-Type': 'application/json'
+    results = {
+        'total': len(items),
+        'success': 0,
+        'failed': 0,
+        'errors': []
     }
     
-    for sku, locations in stock_data.items():
-        try:
-            total = sum(locations.values())
-            
-            # Traži proizvod po SKU-u
-            search_url = f"{wordpress_url}/wp-json/wc/v3/products?sku={sku}"
-            search_resp = requests.get(search_url, headers=headers, timeout=30)
-            
-            if search_resp.status_code != 200:
-                not_found += 1
-                continue
-            
-            products = search_resp.json()
-            
-            if not products or len(products) == 0:
-                not_found += 1
-                continue
-            
-            product_id = products[0]['id']
-            
-            # Updateiraj stock
-            update_url = f"{wordpress_url}/wp-json/wc/v3/products/{product_id}"
-            update_data = {
-                'stock_quantity': total,
-                'manage_stock': True,
-                'stock_status': 'instock' if total > 0 else 'outofstock'
-            }
-            
-            update_resp = requests.put(update_url, headers=headers, json=update_data, timeout=30)
-            
-            if update_resp.status_code == 200:
-                updated += 1
-                if updated % 50 == 0:
-                    print(f"✅ Updated {updated}/{len(stock_data)}")
-            else:
-                errors += 1
-                
-        except Exception as e:
-            errors += 1
+    logger.info(f"📦 Processing {len(items)} items for {location_name}")
     
-    print(f"🎉 {site.upper()} done: {updated} updated, {errors} errors, {not_found} not found")
+    # Podijeli u batch-eve
+    for i in range(0, len(items), BATCH_SIZE):
+        batch = items[i:i + BATCH_SIZE]
+        batch_num = (i // BATCH_SIZE) + 1
+        
+        logger.info(f"Sending batch {batch_num} for {location_name} ({len(batch)} items)")
+        
+        result = send_batch(batch, endpoint)
+        
+        if result['success']:
+            results['success'] += result['count']
+            logger.info(f"✓ Batch {batch_num} successful: {result['count']} items")
+        else:
+            results['failed'] += result['count']
+            results['errors'].append({
+                'batch': batch_num,
+                'error': result.get('error', 'Unknown error')
+            })
+            logger.error(f"✗ Batch {batch_num} failed: {result.get('error')}")
+        
+        # Pauza između batch-eva (osim zadnjeg)
+        if i + BATCH_SIZE < len(items):
+            time.sleep(DELAY_SECONDS)
     
+    logger.info(f"✓ {location_name} completed: {results['success']}/{results['total']} successful")
+    return results
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
     return jsonify({
-        "success": True,
-        "site": site,
-        "updated": updated,
-        "errors": errors,
-        "not_found": not_found,
-        "total_skus": len(sku_list)
-    }), 200
+        'status': 'ok',
+        'service': 'THOR Stock Sync',
+        'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/sync/split', methods=['POST'])
+def sync_split():
+    """Endpoint za Split zalihe"""
+    try:
+        items = request.get_json()
+        
+        if not isinstance(items, list):
+            return jsonify({'error': 'Expected array of items'}), 400
+        
+        logger.info(f"📥 Received {len(items)} Split items")
+        
+        # Odmah vrati odgovor
+        response = jsonify({
+            'status': 'processing',
+            'message': f'Processing {len(items)} Split items in batches of {BATCH_SIZE}',
+            'total': len(items)
+        })
+        
+        # Pokreni procesiranje u pozadini
+        def async_process():
+            results = process_location(items, '/split', 'Split')
+            logger.info(f"Split sync completed: {results}")
+        
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(async_process)
+        
+        return response, 200
+        
+    except Exception as e:
+        logger.error(f"Error in sync_split: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/sync/osijek', methods=['POST'])
+def sync_osijek():
+    """Endpoint za Osijek zalihe"""
+    try:
+        items = request.get_json()
+        
+        if not isinstance(items, list):
+            return jsonify({'error': 'Expected array of items'}), 400
+        
+        logger.info(f"📥 Received {len(items)} Osijek items")
+        
+        # Odmah vrati odgovor
+        response = jsonify({
+            'status': 'processing',
+            'message': f'Processing {len(items)} Osijek items in batches of {BATCH_SIZE}',
+            'total': len(items)
+        })
+        
+        # Pokreni procesiranje u pozadini
+        def async_process():
+            results = process_location(items, '/osijek', 'Osijek')
+            logger.info(f"Osijek sync completed: {results}")
+        
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(async_process)
+        
+        return response, 200
+        
+    except Exception as e:
+        logger.error(f"Error in sync_osijek: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/sync/combined', methods=['POST'])
+def sync_combined():
+    """Endpoint za obje lokacije odjednom"""
+    try:
+        data = request.get_json()
+        
+        split_items = data.get('split', [])
+        osijek_items = data.get('osijek', [])
+        
+        if not isinstance(split_items, list) and not isinstance(osijek_items, list):
+            return jsonify({'error': 'Expected split and/or osijek arrays'}), 400
+        
+        total_count = len(split_items) + len(osijek_items)
+        logger.info(f"📥 Received {len(split_items)} Split + {len(osijek_items)} Osijek items")
+        
+        # Odmah vrati odgovor
+        response = jsonify({
+            'status': 'processing',
+            'message': f'Processing {len(split_items)} Split and {len(osijek_items)} Osijek items',
+            'total': total_count
+        })
+        
+        # Procesiranje u pozadini (paralelno)
+        def async_process():
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = []
+                
+                if split_items:
+                    futures.append(executor.submit(process_location, split_items, '/split', 'Split'))
+                
+                if osijek_items:
+                    futures.append(executor.submit(process_location, osijek_items, '/osijek', 'Osijek'))
+                
+                # Čekaj da sve završi
+                results = [f.result() for f in futures]
+                logger.info(f"Combined sync completed: {results}")
+        
+        executor = ThreadPoolExecutor(max_workers=1)
+        executor.submit(async_process)
+        
+        return response, 200
+        
+    except Exception as e:
+        logger.error(f"Error in sync_combined: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def index():
+    """Root endpoint"""
+    return jsonify({
+        'service': 'THOR Stock Sync Railway',
+        'version': '1.0',
+        'endpoints': {
+            'health': '/health',
+            'split': '/sync/split',
+            'osijek': '/sync/osijek',
+            'combined': '/sync/combined'
+        }
+    })
 
 if __name__ == '__main__':
-    port = int(os.getenv('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
