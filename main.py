@@ -1,27 +1,22 @@
 from flask import Flask, request, jsonify
 import requests
-from woocommerce import API
 import os
+import base64
 
 app = Flask(__name__)
 
-def get_wc_api(site):
+def get_wc_auth(site):
     if site == 'jamjam':
-        return API(
-            url=os.getenv('WORDPRESS_URL', 'https://jamjam.hr'),
-            consumer_key=os.getenv('WC_API_KEY'),
-            consumer_secret=os.getenv('WC_API_SECRET'),
-            version="wc/v3",
-            timeout=120
-        ), os.getenv('WORDPRESS_URL', 'https://jamjam.hr')
-    else:  # berliner
-        return API(
-            url=os.getenv('BERLINER_WORDPRESS_URL', 'https://berliner.hr'),
-            consumer_key=os.getenv('BERLINER_WC_API_KEY'),
-            consumer_secret=os.getenv('BERLINER_WC_API_SECRET'),
-            version="wc/v3",
-            timeout=120
-        ), os.getenv('BERLINER_WORDPRESS_URL', 'https://berliner.hr')
+        key = os.getenv('ck_3ee27ef20acd559b210ea2f4577a9439e0a2cb9f')
+        secret = os.getenv('cs_3beba8b6babdef7c911d90a43a9f2be926292791')
+        url = os.getenv('WORDPRESS_URL', 'https://jamjam.hr')
+    else:
+        key = os.getenv('ck_5958eee3fff61c098712265a905dd9463fb74795')
+        secret = os.getenv('cs_5793896b0048eb854e1592a8def97c2534ce42b9')
+        url = os.getenv('BERLINER_WORDPRESS_URL', 'https://berliner.hr')
+    
+    auth = base64.b64encode(f"{key}:{secret}".encode()).decode()
+    return url, auth
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -36,117 +31,95 @@ def update_stock_berliner():
     return update_stock('berliner')
 
 def update_stock(site):
-    wcapi, wordpress_url = get_wc_api(site)
+    wordpress_url, auth = get_wc_auth(site)
     
     print(f"🚀 {site.upper()} stock update triggered")
     
+    # Dohvati listu SKU-ova iz request body
+    request_data = request.get_json()
+    sku_list = request_data.get('skus', [])
+    
+    if not sku_list or len(sku_list) == 0:
+        return jsonify({"error": "No SKUs provided"}), 400
+    
+    print(f"📦 Received {len(sku_list)} SKUs to update")
+    
+    # Dohvati stock podatke iz WordPress-a
     if site == 'jamjam':
-        endpoint = f"{wordpress_url}/wp-json/jamjam/v1/get-all-stock"
+        stock_endpoint = f"{wordpress_url}/wp-json/jamjam/v1/get-all-stock"
     else:
-        endpoint = f"{wordpress_url}/wp-json/thor/v1/get-all-stock"
+        stock_endpoint = f"{wordpress_url}/wp-json/thor/v1/get-all-stock"
     
     try:
-        response = requests.get(endpoint, timeout=120)
-        stock_data = response.json()
-        total_products = len(stock_data)
-        print(f"📦 Loaded {total_products} products from {site}")
+        response = requests.get(stock_endpoint, timeout=120)
+        all_stock_data = response.json()
     except Exception as e:
-        print(f"❌ Error fetching data: {e}")
+        print(f"❌ Error fetching stock data: {e}")
         return jsonify({"error": str(e)}), 500
     
-    # Batch update - 50 proizvoda odjednom
+    # Filtriraj samo SKU-ove iz liste
+    stock_data = {sku: all_stock_data[sku] for sku in sku_list if sku in all_stock_data}
+    
+    print(f"✅ Found stock data for {len(stock_data)} products")
+    
     updated = 0
     errors = 0
-    skipped = 0
-    batch_data = {'update': []}
+    not_found = 0
     
-    # Prvo kreiraj lookup dictionary (SKU -> product_id)
-    print("🔍 Building SKU lookup...")
-    sku_to_id = {}
-    page = 1
-    per_page = 100
+    headers = {
+        'Authorization': f'Basic {auth}',
+        'Content-Type': 'application/json'
+    }
     
-    while True:
-        try:
-            products = wcapi.get("products", params={"per_page": per_page, "page": page}).json()
-            if not products or len(products) == 0:
-                break
-            
-            for product in products:
-                if 'sku' in product and product['sku']:
-                    sku_to_id[product['sku']] = product['id']
-            
-            page += 1
-            
-            if page % 10 == 0:
-                print(f"📋 Loaded {len(sku_to_id)} products so far...")
-                
-        except Exception as e:
-            print(f"⚠️ Error loading products page {page}: {e}")
-            break
-    
-    print(f"✅ SKU lookup complete: {len(sku_to_id)} products")
-    
-    # Sad updateiraj stock
     for sku, locations in stock_data.items():
         try:
             total = sum(locations.values())
             
-            # Provjeri da li proizvod postoji
-            if sku not in sku_to_id:
-                skipped += 1
+            # Traži proizvod po SKU-u
+            search_url = f"{wordpress_url}/wp-json/wc/v3/products?sku={sku}"
+            search_resp = requests.get(search_url, headers=headers, timeout=30)
+            
+            if search_resp.status_code != 200:
+                not_found += 1
                 continue
             
-            product_id = sku_to_id[sku]
+            products = search_resp.json()
             
-            # Dodaj u batch
-            batch_data['update'].append({
-                'id': product_id,
+            if not products or len(products) == 0:
+                not_found += 1
+                continue
+            
+            product_id = products[0]['id']
+            
+            # Updateiraj stock
+            update_url = f"{wordpress_url}/wp-json/wc/v3/products/{product_id}"
+            update_data = {
                 'stock_quantity': total,
                 'manage_stock': True,
                 'stock_status': 'instock' if total > 0 else 'outofstock'
-            })
+            }
             
-            # Kad stigneš do 50, pošalji batch
-            if len(batch_data['update']) >= 50:
-                try:
-                    result = wcapi.post("products/batch", batch_data)
-                    if result.status_code == 200:
-                        updated += len(batch_data['update'])
-                        print(f"✅ Updated {updated}/{total_products}")
-                    else:
-                        errors += len(batch_data['update'])
-                        print(f"❌ Batch failed: {result.status_code}")
-                    batch_data = {'update': []}
-                except Exception as e:
-                    errors += len(batch_data['update'])
-                    print(f"❌ Batch error: {e}")
-                    batch_data = {'update': []}
+            update_resp = requests.put(update_url, headers=headers, json=update_data, timeout=30)
+            
+            if update_resp.status_code == 200:
+                updated += 1
+                if updated % 50 == 0:
+                    print(f"✅ Updated {updated}/{len(stock_data)}")
+            else:
+                errors += 1
                 
         except Exception as e:
             errors += 1
-            print(f"❌ Error processing {sku}: {e}")
     
-    # Pošalji zadnji batch
-    if len(batch_data['update']) > 0:
-        try:
-            result = wcapi.post("products/batch", batch_data)
-            if result.status_code == 200:
-                updated += len(batch_data['update'])
-            else:
-                errors += len(batch_data['update'])
-        except Exception as e:
-            errors += len(batch_data['update'])
-    
-    print(f"🎉 {site.upper()} done: {updated} updated, {errors} errors, {skipped} skipped")
+    print(f"🎉 {site.upper()} done: {updated} updated, {errors} errors, {not_found} not found")
     
     return jsonify({
         "success": True,
         "site": site,
         "updated": updated,
         "errors": errors,
-        "skipped": skipped,
-        "total": total_products
+        "not_found": not_found,
+        "total_skus": len(sku_list)
     }), 200
 
 if __name__ == '__main__':
