@@ -3,6 +3,7 @@ import requests
 import time
 import logging
 import os
+from threading import Thread
 
 app = Flask(__name__)
 
@@ -91,6 +92,12 @@ def process_location(items, endpoint, location_name, base_url):
     logger.info(f"✅ {location_name} completed: {results['success']}/{results['total']} successful")
     return results
 
+def process_in_background(items, endpoint, location_name, base_url):
+    """Procesira u pozadini"""
+    logger.info(f"🔄 Background processing started for {location_name}")
+    results = process_location(items, endpoint, location_name, base_url)
+    logger.info(f"✅ Background processing completed for {location_name}: {results}")
+
 # ============================================
 # BERLINER ENDPOINTS (Split, Osijek)
 # ============================================
@@ -104,14 +111,21 @@ def berliner_split():
             return jsonify({'error': 'Expected array of items'}), 400
         
         logger.info(f"📥 [BERLINER] Received {len(items)} Split items")
-        results = process_location(items, '/split', 'Berliner Split', WP_BERLINER_URL)
+        
+        # Pokreni u pozadini
+        thread = Thread(
+            target=process_in_background,
+            args=(items, '/split', 'Berliner Split', WP_BERLINER_URL)
+        )
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
-            'status': 'completed',
+            'status': 'accepted',
+            'message': f'Processing {len(items)} items in background',
             'site': 'berliner',
-            'location': 'split',
-            'results': results
-        }), 200
+            'location': 'split'
+        }), 202
     except Exception as e:
         logger.error(f"❌ [BERLINER] Error in split: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -125,14 +139,21 @@ def berliner_osijek():
             return jsonify({'error': 'Expected array of items'}), 400
         
         logger.info(f"📥 [BERLINER] Received {len(items)} Osijek items")
-        results = process_location(items, '/osijek', 'Berliner Osijek', WP_BERLINER_URL)
+        
+        # Pokreni u pozadini
+        thread = Thread(
+            target=process_in_background,
+            args=(items, '/osijek', 'Berliner Osijek', WP_BERLINER_URL)
+        )
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
-            'status': 'completed',
+            'status': 'accepted',
+            'message': f'Processing {len(items)} items in background',
             'site': 'berliner',
-            'location': 'osijek',
-            'results': results
-        }), 200
+            'location': 'osijek'
+        }), 202
     except Exception as e:
         logger.error(f"❌ [BERLINER] Error in osijek: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -153,14 +174,21 @@ def jamjam_location(location):
             return jsonify({'error': 'Expected array of items'}), 400
         
         logger.info(f"📥 [JAMJAM] Received {len(items)} items for {location.upper()}")
-        results = process_location(items, f'/{location}', f'JamJam {location.upper()}', WP_JAMJAM_URL)
+        
+        # Pokreni u pozadini
+        thread = Thread(
+            target=process_in_background,
+            args=(items, f'/{location}', f'JamJam {location.upper()}', WP_JAMJAM_URL)
+        )
+        thread.daemon = True
+        thread.start()
         
         return jsonify({
-            'status': 'completed',
+            'status': 'accepted',
+            'message': f'Processing {len(items)} items in background',
             'site': 'jamjam',
-            'location': location,
-            'results': results
-        }), 200
+            'location': location
+        }), 202
     except Exception as e:
         logger.error(f"❌ [JAMJAM] Error in {location}: {str(e)}")
         return jsonify({'error': str(e)}), 500
@@ -187,7 +215,7 @@ def index():
     """Root endpoint"""
     return jsonify({
         'service': 'Multi-Site Stock Sync Railway',
-        'version': '2.0',
+        'version': '2.1',
         'sites': {
             'berliner': {
                 'url': 'https://berliner.hr',
