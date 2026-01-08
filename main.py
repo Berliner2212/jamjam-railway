@@ -17,8 +17,8 @@ logger = logging.getLogger(__name__)
 WP_JAMJAM_URL = 'https://jamjam.hr/wp-json/jamjam/v1'
 WP_BERLINER_URL = 'https://berliner.hr/wp-json/thor/v1'
 
-BATCH_SIZE = 50
-DELAY_SECONDS = 1
+BATCH_SIZE = 30
+DELAY_SECONDS = 2
 
 # JamJam lokacije
 JAMJAM_LOCATIONS = ['p001', 'p0001', 'p14', 'p18', 'p28', 'p20']
