@@ -29,17 +29,34 @@ def send_batch(items, endpoint, base_url):
     try:
         url = f"{base_url}{endpoint}"
         logger.info(f"🔄 Sending {len(items)} items to {url}")
-        
+
         response = requests.post(
             url,
             json=items,
             timeout=90,
-            headers={'Content-Type': 'application/json'}
+            headers={
+                'Content-Type': 'application/json',
+                'Accept': 'application/json',
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36 BerlinerStockSync/1.0',
+            }
         )
-        
+
         logger.info(f"📡 WordPress response: {response.status_code}")
+        logger.info(f"📡 Final URL: {response.url}")
+        logger.info(f"📡 Body: {response.text[:300]}")
         response.raise_for_status()
-        
+
+        # Provjera da je odgovor stvarno od WordPress plugina, a ne HTML / challenge stranica
+        try:
+            data = response.json()
+        except ValueError:
+            logger.error(f"❌ Non-JSON response for {endpoint} — request did not reach WordPress plugin")
+            return {'success': False, 'count': len(items), 'error': 'Non-JSON response: ' + response.text[:200]}
+
+        if not isinstance(data, dict) or 'status' not in data:
+            logger.error(f"❌ Unexpected response for {endpoint}: {data}")
+            return {'success': False, 'count': len(items), 'error': f'Unexpected response: {data}'}
+
         return {'success': True, 'count': len(items), 'status_code': response.status_code}
     except requests.exceptions.RequestException as e:
         logger.error(f"❌ Request failed for {endpoint}: {str(e)}")
